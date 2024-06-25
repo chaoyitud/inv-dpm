@@ -213,12 +213,13 @@ def get_watermarking_pattern(pipe, args, device, shape=None, option=None):
              [1.1, 0.8, 1.2, 0.9, 0.6, 1.4],
             ]
         )
+        keys = torch.randn(3, args.w_radius)
         const = 80
 
         for i in range(args.w_radius, 0, -1):
             tmp_mask = circle_mask(gt_init.shape[-1], r=i)
             tmp_mask = torch.tensor(tmp_mask).to(device)
-            
+            print(gt_patch.shape)
             for j in range(gt_patch.shape[1]):
                 if option is None:
                     gt_patch[:, j, tmp_mask] = gt_patch_tmp[0, j, 0, i].item()

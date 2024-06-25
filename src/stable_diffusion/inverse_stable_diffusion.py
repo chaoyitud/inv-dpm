@@ -5,8 +5,10 @@ import gc
 import matplotlib.pyplot as plt
 
 import torch
+import wandb
 from torchvision.transforms.functional import to_pil_image
-from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer, get_cosine_schedule_with_warmup
+from transformers import CLIPFeatureExtractor, CLIPTextModel, CLIPTokenizer, get_cosine_schedule_with_warmup, \
+    get_cosine_with_hard_restarts_schedule_with_warmup
 
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
 # from diffusers import StableDiffusionPipeline
@@ -455,14 +457,64 @@ class InversableStableDiffusionPipeline(ModifiedStableDiffusionPipeline):
             x_pred = self.decode_image_for_gradient_float(z)
 
             loss = loss_function(x_pred, input)
-            
+            # update loss to wandb
+            wandb.log({'decoder_loss': loss.item()})
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
         return z
-    
-   
+
+    def decoder_inv_adv(self, x, alpha=0.03, num_trials=8):
+        """
+        decoder_inv_adv calculates latents z of the image x by solving optimization problem ||E(x)-z||,
+        not by directly encoding with VAE encoder. "Decoder inversion"
+
+        INPUT
+        x : image data (1, 3, 512, 512)
+        OUTPUT
+        z : modified latent data (1, 4, 64, 64)
+
+        Goal : minimize norm(e(x)-z) and choose the best z from multiple trials based on the lowest loss_a.
+        """
+        correct_z = self.decoder_inv(x)
+        input = x.clone().float()
+
+        best_loss = float('inf')
+        best_z = None
+
+        # Perform trials
+        for trial in range(num_trials):
+            z = self.get_random_latents().clone().float()
+            z.requires_grad_(True)
+
+            optimizer = torch.optim.AdamW([z], lr=1, weight_decay=1e-6)
+            lr_scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=500, num_training_steps=2000)
+            #lr_scheduler = get_cosine_with_hard_restarts_schedule_with_warmup(optimizer, num_warmup_steps=300, num_training_steps=1000, num_cycles=5)
+            for i in self.progress_bar(range(3000)):
+                x_pred = self.decode_image_for_gradient_float(z)
+                loss_a = torch.nn.MSELoss(reduction='sum')(x_pred, input)
+                loss_b = -torch.nn.MSELoss(reduction='sum')(z, correct_z)
+                loss = (1 - alpha) * loss_a + alpha * loss_b
+                wandb.log({
+                    f'decoder_adv_loss_a_trial_{trial}': loss_a.item(),
+                    f'decoder_adv_loss_b_trial_{trial}': -loss_b.item(),
+                    f'decoder_adv_loss_trial_{trial}': loss.item()
+                })
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                lr_scheduler.step()
+
+            # Log final loss values for each trial
+
+            # Update best z based on loss_a
+            if loss_a.item() < best_loss:
+                best_loss = loss_a.item()
+                best_z = z.detach().clone()  # detach and clone to remove from current graph
+
+        return best_z
+
         
 class StepScheduler(ReduceLROnPlateau):
     def __init__(self, mode='min', current_lr=0, factor=0.1, patience=10,

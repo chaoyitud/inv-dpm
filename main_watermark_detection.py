@@ -1,4 +1,6 @@
 import argparse
+from io import BytesIO
+
 import wandb
 import copy
 from tqdm import tqdm
@@ -16,8 +18,8 @@ import torch
 
 # optim_utils include "get_watermarking_pattern" that performs similar job
 # This is modified version to be applicable on watermark detection
-def get_watermarking_patterns(pipe, args, device, shape=None, option=None):
-    set_random_seed(args.w_seed)
+def get_watermarking_patterns(pipe, args, device, shape=None, option=None, seed_shift=0):
+    set_random_seed(args.w_seed+seed_shift)
     if shape is not None:
         gt_init = torch.randn(*shape, device=device)
     else:
@@ -33,6 +35,8 @@ def get_watermarking_patterns(pipe, args, device, shape=None, option=None):
              [0.7, 1.2, 1.3, 0.8, 0.9, 1.1, 0.8, 1.2, 1.3, 0.7],
             ]
         )
+        keys = torch.abs(torch.randn(3, args.w_radius))
+
         const = 80
 
         for i in range(args.w_radius, 0, -1):
@@ -52,7 +56,7 @@ def main(args):
         wandb.init(project='watermark_detection for zolp', name=args.run_name)
         wandb.config.update(args)
         table = wandb.Table(columns=['prompt', 'gen_now1', 'gen_now2', 'gen_now3', 'gen_w1', 'gen_w2', 'gen_w3', 'w_metric11', 'w_metric12', 'w_metric13', 'w_metric21', 'w_metric22', 'w_metric23', 'w_metric31', 'w_metric32', 'w_metric33'])
-    
+        table_fft = wandb.Table(columns=['prompt','fft_now1', 'fft_now2', 'fft_now3', 'fft_w1', 'fft_w2', 'fft_w3', 'fft_orig1', 'fft_orig2', 'fft_orig3'])
     # load diffusion model
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
@@ -80,7 +84,7 @@ def main(args):
     # Create patchs
     gt_patches = []
     for i in range(args.target_num):
-        gt_patches.append(get_watermarking_patterns(pipe, args, device, option=i))
+        gt_patches.append(get_watermarking_patterns(pipe, args, device, option=None, seed_shift=i))
 
     w_metrics = [[[], [], []],[[], [], []],[[], [], []]]
     no_w_metrics = [[[], [], []],[[], [], []],[[], [], []]]
@@ -120,6 +124,8 @@ def main(args):
 
         for i in range(args.target_num):
             init_latents_no_w_array.append(pipe.get_random_latents())
+            # print shape of init_latents_no_w_array
+            print(init_latents_no_w_array[-1].shape)
             init_latents_w_array.append(copy.deepcopy(init_latents_no_w_array[-1]))
 
             outputs_no_w, latents_no_w = pipe(
@@ -144,9 +150,21 @@ def main(args):
         # Inject watermark
         for i in range(args.target_num):
             temp_init_latents_w, temp_fft = inject_watermark(init_latents_w_array[i], watermarking_masks[i], gt_patches[i], args)
+            # do fft for visualization
+            temp_fft = torch.abs(torch.fft.fftshift(torch.fft.fft2(temp_init_latents_w), dim=(-1, -2)))
+            plt.figure(figsize=(10, 10))
+            plt.imshow(temp_fft.detach().cpu().numpy()[0,0], cmap='hot', interpolation='none')
+            plt.colorbar()
+            plt.title(f'Fourier Transform of Watermarked Tensor {i}')
+            plt.grid(False)
+            # Log the buffer as an image to wandb
+            wandb.log({f'fft_w': wandb.Image(plt)})
+            # Append results to lists
             init_latents_ws.append(temp_init_latents_w)
             ffts.append(temp_fft)
 
+            # Clear the current figure in matplotlib to free memory
+            plt.close()
         # Create image
         orig_image_ws = []
         for i in range(args.target_num):
@@ -172,7 +190,7 @@ def main(args):
             if args.wo_decoder_inv:
                 image_latents_w = pipe.get_image_latents(img_w, sample=False)
             else:    
-                image_latents_w = pipe.decoder_inv(img_w)
+                image_latents_w = pipe.decoder_inv_adv(img_w)
         
             # forward_diffusion -> inversion
             reversed_latents_w = pipe.forward_diffusion(
@@ -183,9 +201,31 @@ def main(args):
                 inverse_opt=(args.inv_order!=0),
                 inv_order=args.inv_order,
             )
+
             img_ws.append(img_w)
             image_latents_ws.append(image_latents_w)
             reversed_latents_ws.append(reversed_latents_w)
+            temp_fft = torch.abs(torch.fft.fftshift(torch.fft.fft2(reversed_latents_ws[-1]), dim=(-1, -2)))
+            plt.figure(figsize=(10, 10))
+            plt.imshow(temp_fft.detach().cpu().numpy()[0,0], cmap='hot', interpolation='none')
+            plt.colorbar()
+            plt.title(f'Fourier Transform of Watermarked Tensor {i}')
+            plt.grid(False)
+            # Log the buffer as an image to wandb
+            wandb.log({f'fft_w_r': wandb.Image(plt)})
+
+            outputs_rev_w, latents_rev_w = pipe(
+                current_prompt,
+                num_images_per_prompt=args.num_images,
+                guidance_scale=args.guidance_scale,
+                num_inference_steps=args.num_inference_steps,
+                height=args.image_length,
+                width=args.image_length,
+                latents=reversed_latents_ws[i],
+                )
+            orig_image_rev_w = outputs_rev_w.images[0]
+            wandb.log({f'w_image': wandb.Image(orig_image_ws[i])})
+            wandb.log({f'rev_w_image': wandb.Image(orig_image_rev_w)})
 
         ## 3. Evaluation Period
         # Second check w_metric of n*n cases
@@ -201,7 +241,8 @@ def main(args):
                                wandb.Image(orig_image_ws[0]), wandb.Image(orig_image_ws[1]), wandb.Image(orig_image_ws[2]),
                                w_metrics[0][0][-1], w_metrics[0][1][-1], w_metrics[0][2][-1], w_metrics[1][0][-1], w_metrics[1][1][-1], w_metrics[1][2][-1], w_metrics[2][0][-1], w_metrics[2][1][-1], w_metrics[2][2][-1],
                                )
-
+            print(w_metrics)
+            print(no_w_metrics)
         ind = ind + 1
 
     # Calculate confusion matrix of WM detection
@@ -254,7 +295,7 @@ if __name__ == '__main__':
     parser.add_argument('--w_channel', default=0, type=int)
     parser.add_argument('--w_pattern', default='ring')
     parser.add_argument('--w_mask_shape', default='circle')
-    parser.add_argument('--w_radius', default=6, type=int)
+    parser.add_argument('--w_radius', default=16, type=int)
     parser.add_argument('--w_measurement', default='l1_complex')
     parser.add_argument('--w_injection', default='complex')
     parser.add_argument('--w_pattern_const', default=0, type=float)
